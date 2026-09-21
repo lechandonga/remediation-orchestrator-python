@@ -1,8 +1,12 @@
 from fastapi import FastAPI
 
-app = FastAPI()
+from orchestrator.service import OrchestratorService
+from orchestrator.store import Store
+from orchestrator.suppression import SuppressionRegistry
+
+app = FastAPI(title="Remediation Orchestrator")
 
 
 @app.get("/")
 def read_root():
-    return {"Hello": "World"}
+    return {"service": "remediation-orchestrator", "status": "ok"}
