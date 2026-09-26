@@ -15,8 +15,18 @@ ALLOWED: dict[ExecutionStatus, frozenset[ExecutionStatus]] = {
     ExecutionStatus.RUNNING: frozenset(
         {ExecutionStatus.SUCCEEDED, ExecutionStatus.FAILED, ExecutionStatus.ABANDONED}
     ),
-    # FAILED -> PENDING 表示一次重试重新排队
-    ExecutionStatus.FAILED: frozenset({ExecutionStatus.PENDING, ExecutionStatus.ABANDONED}),
+    ExecutionStatus.FAILED: frozenset(
+        {
+            ExecutionStatus.PENDING,       # v1 记录：失败后立即重新排队
+            ExecutionStatus.WAITING_RETRY,  # v2 记录：失败后进入定时等待
+            ExecutionStatus.ABANDONED,
+        }
+    ),
+    # WAITING_RETRY -> RUNNING：排期到期后被消费方接管
+    # WAITING_RETRY -> ABANDONED：恢复/人工放弃
+    ExecutionStatus.WAITING_RETRY: frozenset(
+        {ExecutionStatus.RUNNING, ExecutionStatus.ABANDONED}
+    ),
     ExecutionStatus.SUCCEEDED: frozenset(),
     ExecutionStatus.ABANDONED: frozenset(),
     ExecutionStatus.SUPPRESSED: frozenset(),
