@@ -144,7 +144,12 @@ def test_concurrent_run_execution_idempotent():
 
     log.info("判定依据: 并发执行 成功=%d 冲突拒绝=%d", len(outcomes), len(errors))
     assert len(outcomes) == 1 and len(errors) == 1
-    assert errors[0].reason is TransitionRejection.ILLEGAL_TRANSITION
+    # 失败方拿到明确的失败结论：读到中间态 -> CAS 冲突（ILLEGAL_TRANSITION）；
+    # 读到已完成态 -> 终态拒绝（TERMINAL_STATE），两者均可区分且不会重复执行
+    assert errors[0].reason in (
+        TransitionRejection.ILLEGAL_TRANSITION,
+        TransitionRejection.TERMINAL_STATE,
+    )
     rec = svc.get_execution(r.execution_id)
     assert rec.status is S.SUCCEEDED and rec.attempt == 1  # 无重复计数
     transitions = [a for a in svc._store.audit_log() if a[1] == "TRANSITION"]
@@ -188,10 +193,13 @@ def test_retry_exhaustion_reaches_terminal_without_drift():
 
     rec = svc.run_execution(eid, succeed=False, now=1.0)
     log.info("状态流转: attempt=%d status=%s detail=%s", rec.attempt, rec.status, rec.detail)
-    assert rec.status is S.PENDING and rec.attempt == 1
-    rec = svc.run_execution(eid, succeed=False, now=2.0)
-    assert rec.status is S.PENDING and rec.attempt == 2
-    rec = svc.run_execution(eid, succeed=False, now=3.0)
+    # 新语义：失败后进入等待重试阶段，携带最早可执行时刻与剩余次数
+    assert rec.status is S.WAITING_RETRY and rec.attempt == 1
+    assert rec.next_attempt_at == 2.0 and rec.remaining_attempts == 2
+    rec = svc.run_execution(eid, succeed=False, now=2.0)  # 到期后允许继续
+    assert rec.status is S.WAITING_RETRY and rec.attempt == 2
+    assert rec.next_attempt_at == 4.0 and rec.remaining_attempts == 1
+    rec = svc.run_execution(eid, succeed=False, now=4.0)
     log.info("状态流转: attempt=%d status=%s detail=%s", rec.attempt, rec.status, rec.detail)
     assert rec.status is S.ABANDONED and rec.attempt == 3  # max_retries=2 -> 共 3 次尝试
 

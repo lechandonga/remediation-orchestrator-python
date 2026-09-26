@@ -15,8 +15,19 @@ ALLOWED: dict[ExecutionStatus, frozenset[ExecutionStatus]] = {
     ExecutionStatus.RUNNING: frozenset(
         {ExecutionStatus.SUCCEEDED, ExecutionStatus.FAILED, ExecutionStatus.ABANDONED}
     ),
-    # FAILED -> PENDING 表示一次重试重新排队
-    ExecutionStatus.FAILED: frozenset({ExecutionStatus.PENDING, ExecutionStatus.ABANDONED}),
+    # FAILED -> WAITING_RETRY 表示按时间排期等待重试（v2 记录）；
+    # FAILED -> PENDING 保留给 v1 历史记录的"立即重排"旧语义
+    ExecutionStatus.FAILED: frozenset(
+        {
+            ExecutionStatus.PENDING,
+            ExecutionStatus.WAITING_RETRY,
+            ExecutionStatus.ABANDONED,
+        }
+    ),
+    # 等待重试到期后可进入 RUNNING；也可能被恢复/人工置为 ABANDONED
+    ExecutionStatus.WAITING_RETRY: frozenset(
+        {ExecutionStatus.RUNNING, ExecutionStatus.ABANDONED}
+    ),
     ExecutionStatus.SUCCEEDED: frozenset(),
     ExecutionStatus.ABANDONED: frozenset(),
     ExecutionStatus.SUPPRESSED: frozenset(),

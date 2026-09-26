@@ -7,8 +7,8 @@
 
 ```
 orchestrator/
-  models.py        # 数据模型与枚举（状态、去重结论、抑制/拒绝原因、SCHEMA_VERSION）
-  store.py         # SQLite 持久化：指纹占用、执行记录、审计日志（重启不丢状态）
+  models.py        # 数据模型与枚举（状态、去重结论、抑制/拒绝原因、记录/策略版本）
+  store.py         # SQLite 持久化：指纹占用、执行记录、审计日志、幂等迁移（重启不丢状态）
   dedup.py         # 告警去重判定（指纹 + 冷却窗口）
   policy.py        # 策略匹配、优先级判定与版本兼容校验
   statemachine.py  # 执行状态机（合法流转表 + 可区分拒绝原因）
@@ -30,16 +30,19 @@ main.py            # FastAPI 入口
 ## 状态机规则
 
 ```
-PENDING  -> RUNNING | ABANDONED | SUPPRESSED
-RUNNING  -> SUCCEEDED | FAILED | ABANDONED
-FAILED   -> PENDING（重试）| ABANDONED（重试耗尽）
+PENDING       -> RUNNING | ABANDONED | SUPPRESSED
+RUNNING       -> SUCCEEDED | FAILED | ABANDONED
+FAILED        -> WAITING_RETRY（v2 定时排期）| PENDING（v1 旧语义）| ABANDONED（重试耗尽）
+WAITING_RETRY -> RUNNING（到期后）| ABANDONED
 SUCCEEDED / ABANDONED / SUPPRESSED 为终态
 ```
 
 非法流转被拒绝并给出可区分原因（`TransitionError.reason`）：
 
 - `TERMINAL_STATE`：当前状态已是终态；
-- `ILLEGAL_TRANSITION`：目标状态不在允许集合内，或状态被并发修改（CAS 失败）。
+- `ILLEGAL_TRANSITION`：目标状态不在允许集合内，或状态被并发修改（CAS 失败）；
+- `RETRY_NOT_DUE`：记录处于等待重试阶段，还没到最早可执行时刻；
+- `RETRY_EXHAUSTED`：等待重试记录的剩余尝试次数已耗尽，不能再试。
 
 状态更新通过 SQLite 的条件 UPDATE（compare-and-set）完成，并发下只有一个
 调用方能推进状态，不会产生半更新状态或重复计数。
@@ -68,12 +71,53 @@ SUCCEEDED / ABANDONED / SUPPRESSED 为终态
   且 `source` 记录窗口 ID 或规则 ID 以便追溯；
 - 被抑制的告警不创建执行记录，仅写审计日志。
 
-## 重试与退避
+## 重试与退避（定时排期）
 
-- 上限由策略 `max_retries` 配置；第 `attempt` 次失败后退避
-  `base_backoff * 2^(attempt-1)` 秒；
+- 上限由策略 `max_retries` 配置（总尝试次数 = `max_retries + 1`）；第 `attempt`
+  次失败后退避 `base_backoff * 2^(attempt-1)` 秒；
+- **失败后不会立刻重新变成可执行**：v2 记录进入 `WAITING_RETRY` 阶段，并持久化
+  `next_attempt_at`（最早可执行时刻）与 `remaining_attempts`（剩余尝试次数）；
+- 在该时刻到来之前，任何推进请求都会被挡下，且拒绝原因可区分：
+  `RETRY_NOT_DUE`（还没到时间）/ `RETRY_EXHAUSTED`（已经不能再试）/
+  `TERMINAL_STATE`、`ILLEGAL_TRANSITION`（当前状态根本不允许推进）；
 - 达到上限后进入终态 `ABANDONED`，审计日志记录 `RETRY_EXHAUSTED`；
 - 重试判定为纯函数，副作用仅发生在状态 CAS 成功之后，重试期间无重复计数。
+
+### 到期重试的批量消费
+
+- `GET /retries/due`（或服务方法 `list_due_retries(now)`）一次列出当前所有
+  已到期的等待重试记录，供后台任务或操作者批量消费；
+- 消费方通过 `POST /retries/{id}/claim`（或 `claim_due_retry`）原子接管：
+  单条 SQL 内完成状态、到期条件校验与尝试计数自增，多路并发消费同一记录时
+  **只有一个消费方成功**，其余拿到 `ILLEGAL_TRANSITION` 的明确失败结论；
+  反复消费不会重复取走同一条记录，尝试/成功计数不会漂移；
+- 接管成功后由 `POST /executions/{id}/finish`（或 `finish_execution`）上报结果。
+
+## 重启恢复口径
+
+服务启动时（`main.py`）及服务方法 `recover_interrupted(now)` 执行确定恢复：
+
+- 重启前已开始但未给出结果（`RUNNING` 悬挂）的记录，经 CAS 收尾为终态
+  `ABANDONED`，审计日志写入 `RECOVERY` 事件及依据
+  （`RECOVERY_INTERRUPTED: 服务重启前执行未给出结果...`）；恢复幂等，
+  不增加 `attempt`，不对已计数的尝试重复计数；
+- 重启前还没到时间的 `WAITING_RETRY` 记录，其 `next_attempt_at` 与
+  `remaining_attempts` **原样保留**，不会被提前安排、推迟或清零，
+  到期后仍可正常被消费。
+
+## 记录版本兼容
+
+- 执行记录结构版本由 `RECORD_SCHEMA_VERSION = 2` 标识（与策略版本
+  `SCHEMA_VERSION` 相互独立）；
+- **v1（历史记录）**：无排期字段。启动时存储层幂等迁移（`ALTER TABLE` 补列，
+  默认值 `record_version=1 / next_attempt_at=0 / remaining_attempts=-1`），
+  已有行不被改写；v1 记录按原语义继续参与执行——失败后立即回到 `PENDING`，
+  无排期门控，不会被当作数据缺失或直接失败；
+- **v2（当前版本）**：失败后进入 `WAITING_RETRY` 定时排期；
+- **高于当前版本的记录**：读取与推进时抛出 `RecordVersionError`
+  （HTTP 422，`UNSUPPORTED_RECORD_VERSION`），与"记录不存在"（KeyError /
+  HTTP 404）和"状态不允许推进"（`TransitionError` / HTTP 409）明确区分，
+  绝不硬按旧语义解释；也不会混入到期重试列表被批量消费。
 
 ## 权限校验
 
@@ -91,7 +135,14 @@ SUCCEEDED / ABANDONED / SUPPRESSED 为终态
 | --- | --- | --- |
 | POST | `/alerts` | 受理告警（需 `Authorization: <subject>:<role>` 头） |
 | POST | `/executions/{id}/run` | 推进一次执行（`{"succeed": true/false}` 模拟执行结果） |
-| GET  | `/executions/{id}` | 查询执行记录 |
+| GET  | `/executions/{id}` | 查询执行记录（含排期字段与记录版本） |
+| GET  | `/retries/due` | 列出当前所有已到期的等待重试记录 |
+| POST | `/retries/{id}/claim` | 原子接管一条到期重试记录（并发下仅一方成功） |
+| POST | `/executions/{id}/finish` | 对已接管（RUNNING）的记录上报执行结果 |
+
+错误映射：记录不存在 -> 404；版本不受支持 -> 422
+（`UNSUPPORTED_RECORD_VERSION`）；状态/排期拒绝 -> 409
+（`TERMINAL_STATE` / `ILLEGAL_TRANSITION` / `RETRY_NOT_DUE` / `RETRY_EXHAUSTED`）。
 
 数据库路径由环境变量 `ORCHESTRATOR_DB` 指定（默认 `orchestrator.db`）。
 
@@ -99,9 +150,24 @@ SUCCEEDED / ABANDONED / SUPPRESSED 为终态
 
 ```bash
 uv sync
-uv run pytest tests/ -v        # 13 个测试：重复告警/并发/非法流转/重试耗尽等
-uv run uvicorn main:app        # 启动服务
+uv run pytest tests/ -v        # 23 个测试：去重/并发/非法流转/定时重试/恢复/版本兼容等
+uv run uvicorn main:app        # 启动服务（启动时自动执行重启恢复）
 ```
 
 测试日志（`-v` 或 `--log-cli-level=INFO`）会打印事件、策略、状态流转与判定依据，
-例如去重结论、重试决策（`RETRY_SCHEDULED` / `RETRY_EXHAUSTED`）与每次状态流转。
+例如去重结论、重试决策（`RETRY_SCHEDULED` / `RETRY_EXHAUSTED`）、排期字段
+（`next_attempt_at` / `remaining_attempts`）与恢复依据（`RECOVERY_INTERRUPTED`）。
+
+### 本地复现关键行为
+
+- **定时排期**：`POST /alerts` 受理后 `POST /executions/{id}/run`
+  `{"succeed": false}`，记录进入 `WAITING_RETRY`；立即再次 run 会收到
+  409 `RETRY_NOT_DUE`，退避时长（默认指数退避）到期后再 run 才放行；
+- **批量消费**：`GET /retries/due` 查到期记录，`POST /retries/{id}/claim`
+  接管后 `POST /executions/{id}/finish` 上报结果；并发 claim 同一记录仅一方成功；
+- **重启恢复**：让一条记录停在 `RUNNING`（如 claim 后不 finish），重启进程，
+  启动日志/审计中可见 `RECOVERY` 事件，该记录被收尾为 `ABANDONED`；
+  未到期的 `WAITING_RETRY` 记录排期字段重启前后保持一致；
+- **版本兼容**：测试 `test_old_schema_db_migrated_and_readable` 构造 v1 时代的
+  历史库验证幂等迁移与旧语义执行；`test_unsupported_future_version_rejected_distinctly`
+  验证未来版本记录被明确拒绝（422）且与 404/409 分得开。

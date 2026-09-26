@@ -5,7 +5,28 @@ import enum
 from dataclasses import dataclass, field
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 1  # 策略版本兼容上限
+
+# 执行记录结构版本：
+# - v1：历史记录，无定时重试字段，失败后立即回到 PENDING（旧语义）；
+# - v2：引入 WAITING_RETRY 排期字段（next_attempt_at / remaining_attempts）。
+RECORD_SCHEMA_VERSION = 2
+
+
+class RecordVersionError(Exception):
+    """执行记录声明了当前不支持的版本。
+
+    与"记录不存在"（KeyError）和"状态不允许推进"（TransitionError）
+    明确区分开，绝不硬按旧语义解释。
+    """
+
+    def __init__(self, execution_id: str, record_version: int) -> None:
+        super().__init__(
+            f"执行记录 {execution_id} 的版本 v{record_version} 高于当前支持的 "
+            f"v{RECORD_SCHEMA_VERSION}，拒绝按旧语义解释"
+        )
+        self.execution_id = execution_id
+        self.record_version = record_version
 
 
 class ExecutionStatus(str, enum.Enum):
@@ -13,6 +34,7 @@ class ExecutionStatus(str, enum.Enum):
 
     PENDING = "PENDING"
     RUNNING = "RUNNING"
+    WAITING_RETRY = "WAITING_RETRY"  # 等待重试：未到 next_attempt_at 不可推进
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     ABANDONED = "ABANDONED"
@@ -24,7 +46,8 @@ class TransitionRejection(str, enum.Enum):
 
     TERMINAL_STATE = "TERMINAL_STATE"
     ILLEGAL_TRANSITION = "ILLEGAL_TRANSITION"
-    RETRY_EXHAUSTED = "RETRY_EXHAUSTED"
+    RETRY_NOT_DUE = "RETRY_NOT_DUE"  # 等待重试但还没到最早可执行时刻
+    RETRY_EXHAUSTED = "RETRY_EXHAUSTED"  # 剩余尝试次数已耗尽
 
 
 class DedupDecision(str, enum.Enum):
@@ -76,7 +99,13 @@ class RemediationPolicy:
 
 @dataclass
 class ExecutionRecord:
-    """执行记录。"""
+    """执行记录。
+
+    版本兼容：
+    - record_version=1（历史记录）：无排期字段，next_attempt_at 恒为 0
+      （立即可执行），remaining_attempts 为 -1（未排期，按策略实时判定）；
+    - record_version=2：失败后进入 WAITING_RETRY 并携带排期字段。
+    """
 
     execution_id: str
     fingerprint: str
@@ -85,3 +114,6 @@ class ExecutionRecord:
     status: ExecutionStatus = ExecutionStatus.PENDING
     attempt: int = 0
     detail: str = ""
+    record_version: int = RECORD_SCHEMA_VERSION
+    next_attempt_at: float = 0.0  # 最早可执行时刻（WAITING_RETRY 时生效）
+    remaining_attempts: int = -1  # 剩余尝试次数；-1 表示未排期（v1 语义）

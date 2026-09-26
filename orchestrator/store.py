@@ -8,7 +8,12 @@ from __future__ import annotations
 import sqlite3
 import threading
 
-from .models import ExecutionRecord, ExecutionStatus
+from .models import (
+    RECORD_SCHEMA_VERSION,
+    ExecutionRecord,
+    ExecutionStatus,
+    RecordVersionError,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS fingerprints (
@@ -26,7 +31,10 @@ CREATE TABLE IF NOT EXISTS executions (
     status         TEXT NOT NULL,
     attempt        INTEGER NOT NULL DEFAULT 0,
     detail         TEXT NOT NULL DEFAULT '',
-    updated_at     REAL NOT NULL DEFAULT 0
+    updated_at     REAL NOT NULL DEFAULT 0,
+    record_version INTEGER NOT NULL DEFAULT 1,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    remaining_attempts INTEGER NOT NULL DEFAULT -1
 );
 CREATE TABLE IF NOT EXISTS audit_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,6 +44,14 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail     TEXT NOT NULL
 );
 """
+
+# 历史库（v1 结构）缺少的列，启动时幂等补齐；已存在行保持默认值，
+# 即 record_version=1、next_attempt_at=0、remaining_attempts=-1（旧语义）
+_MIGRATIONS = (
+    "ALTER TABLE executions ADD COLUMN record_version INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE executions ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE executions ADD COLUMN remaining_attempts INTEGER NOT NULL DEFAULT -1",
+)
 
 
 class Store:
@@ -47,6 +63,15 @@ class Store:
         self._lock = threading.Lock()
         with self._conn:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """幂等补齐历史库缺失的列（记录级版本兼容，不改写已有行）。"""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(executions)")}
+        for stmt in _MIGRATIONS:
+            col = stmt.split("ADD COLUMN ")[1].split(" ")[0]
+            if col not in cols:
+                self._conn.execute(stmt)
 
     def close(self) -> None:
         self._conn.close()
@@ -88,30 +113,11 @@ class Store:
             )
 
     # ---- 执行记录 ----
-    def create_execution(self, record: ExecutionRecord) -> None:
-        with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT INTO executions"
-                " (execution_id, fingerprint, policy_id, policy_version, status, attempt, detail)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    record.execution_id,
-                    record.fingerprint,
-                    record.policy_id,
-                    record.policy_version,
-                    record.status.value,
-                    record.attempt,
-                    record.detail,
-                ),
-            )
-
-    def get_execution(self, execution_id: str) -> ExecutionRecord | None:
-        cur = self._conn.execute(
-            "SELECT * FROM executions WHERE execution_id = ?", (execution_id,)
-        )
-        row = cur.fetchone()
-        if row is None:
-            return None
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row) -> ExecutionRecord:
+        record_version = row["record_version"]
+        if record_version > RECORD_SCHEMA_VERSION:
+            raise RecordVersionError(row["execution_id"], record_version)
         return ExecutionRecord(
             execution_id=row["execution_id"],
             fingerprint=row["fingerprint"],
@@ -120,7 +126,42 @@ class Store:
             status=ExecutionStatus(row["status"]),
             attempt=row["attempt"],
             detail=row["detail"],
+            record_version=record_version,
+            next_attempt_at=row["next_attempt_at"],
+            remaining_attempts=row["remaining_attempts"],
         )
+
+    def create_execution(self, record: ExecutionRecord) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO executions"
+                " (execution_id, fingerprint, policy_id, policy_version, status, attempt,"
+                " detail, record_version, next_attempt_at, remaining_attempts)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.execution_id,
+                    record.fingerprint,
+                    record.policy_id,
+                    record.policy_version,
+                    record.status.value,
+                    record.attempt,
+                    record.detail,
+                    record.record_version,
+                    record.next_attempt_at,
+                    record.remaining_attempts,
+                ),
+            )
+
+    def get_execution(self, execution_id: str) -> ExecutionRecord | None:
+        """读取执行记录；版本不受支持时抛出 RecordVersionError（与不存在区分）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM executions WHERE execution_id = ?", (execution_id,)
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return self._row_to_record(row)
 
     def compare_and_set_status(
         self,
@@ -130,26 +171,80 @@ class Store:
         attempt: int,
         detail: str,
         now: float,
+        next_attempt_at: float | None = None,
+        remaining_attempts: int | None = None,
     ) -> bool:
         """CAS 更新状态：仅当当前状态属于 expected 集合时更新成功。
 
         并发下只有一个调用方能成功，避免半更新状态与计数漂移。
+        next_attempt_at / remaining_attempts 为 None 时保持原值不变。
         """
         placeholders = ",".join("?" for _ in expected)
         with self._lock, self._conn:
             cur = self._conn.execute(
-                f"UPDATE executions SET status = ?, attempt = ?, detail = ?, updated_at = ?"
+                f"UPDATE executions SET status = ?, attempt = ?, detail = ?, updated_at = ?,"
+                f" next_attempt_at = COALESCE(?, next_attempt_at),"
+                f" remaining_attempts = COALESCE(?, remaining_attempts)"
                 f" WHERE execution_id = ? AND status IN ({placeholders})",
                 (
                     new_status.value,
                     attempt,
                     detail,
                     now,
+                    next_attempt_at,
+                    remaining_attempts,
                     execution_id,
                     *(s.value for s in expected),
                 ),
             )
             return cur.rowcount == 1
+
+    # ---- 定时重试排期 ----
+    def list_due_retries(self, now: float) -> list[ExecutionRecord]:
+        """列出所有已到期的等待重试记录（按最早可执行时刻排序，供批量消费）。
+
+        版本高于当前支持的记录不列出（读取时会明确拒绝，绝不按旧语义解释）。
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM executions WHERE status = ? AND next_attempt_at <= ?"
+                " AND record_version <= ? ORDER BY next_attempt_at, execution_id",
+                (ExecutionStatus.WAITING_RETRY.value, now, RECORD_SCHEMA_VERSION),
+            )
+            rows = cur.fetchall()
+        return [self._row_to_record(r) for r in rows]
+
+    def claim_due_retry(self, execution_id: str, now: float) -> bool:
+        """原子接管一条已到期的等待重试记录：WAITING_RETRY -> RUNNING。
+
+        单条 SQL 内完成状态、到期条件校验与尝试计数自增，
+        多路并发消费时只有一个消费方能成功，且计数只增加一次。
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE executions SET status = ?, attempt = attempt + 1,"
+                " detail = '接管到期重试，开始执行', updated_at = ?"
+                " WHERE execution_id = ? AND status = ? AND next_attempt_at <= ?",
+                (
+                    ExecutionStatus.RUNNING.value,
+                    now,
+                    execution_id,
+                    ExecutionStatus.WAITING_RETRY.value,
+                    now,
+                ),
+            )
+            return cur.rowcount == 1
+
+    # ---- 重启恢复 ----
+    def list_interrupted(self) -> list[ExecutionRecord]:
+        """列出重启前已开始但未给出结果的记录（RUNNING 悬挂）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM executions WHERE status = ? AND record_version <= ?",
+                (ExecutionStatus.RUNNING.value, RECORD_SCHEMA_VERSION),
+            )
+            rows = cur.fetchall()
+        return [self._row_to_record(r) for r in rows]
 
     # ---- 审计 ----
     def audit(self, event_type: str, subject: str, detail: str, now: float) -> None:
@@ -160,7 +255,8 @@ class Store:
             )
 
     def audit_log(self) -> list[tuple]:
-        cur = self._conn.execute(
-            "SELECT ts, event_type, subject, detail FROM audit_log ORDER BY id"
-        )
-        return [tuple(r) for r in cur.fetchall()]
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT ts, event_type, subject, detail FROM audit_log ORDER BY id"
+            )
+            return [tuple(r) for r in cur.fetchall()]

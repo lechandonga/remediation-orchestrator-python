@@ -14,22 +14,31 @@ class RetryDecision:
     should_retry: bool
     next_attempt: int
     backoff_seconds: float
+    remaining_attempts: int  # 本次失败后仍允许的尝试次数（不含已失败的这次）
     reason: str  # RETRY_SCHEDULED / RETRY_EXHAUSTED
 
 
 def decide_retry(attempt: int, max_retries: int, base_backoff: float = 1.0) -> RetryDecision:
-    """根据当前已失败次数（attempt，从 1 计）决定是否重试及退避时长。"""
-    if attempt <= max_retries:
+    """根据当前已失败次数（attempt，从 1 计）决定是否重试及退避时长。
+
+    总尝试上限为 max_retries + 1 次；remaining_attempts 表示本次失败后
+    还允许再尝试的次数，供排期字段持久化，重启后原样恢复。
+    """
+    remaining = max_retries + 1 - attempt
+    if remaining >= 1:
         backoff = base_backoff * (2 ** (attempt - 1))
         return RetryDecision(
             True,
             attempt + 1,
             backoff,
-            f"RETRY_SCHEDULED: 第 {attempt} 次失败，{backoff}s 后进行第 {attempt + 1} 次尝试",
+            remaining,
+            f"RETRY_SCHEDULED: 第 {attempt} 次失败，{backoff}s 后进行第 {attempt + 1} 次尝试"
+            f"（剩余 {remaining} 次）",
         )
     return RetryDecision(
         False,
         attempt,
         0.0,
+        0,
         f"RETRY_EXHAUSTED: 已达重试上限 {max_retries} 次，进入终态 ABANDONED",
     )
