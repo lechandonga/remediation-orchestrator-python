@@ -17,16 +17,37 @@ class RecordVersionError(Exception):
     """执行记录声明了当前不支持的版本。
 
     与"记录不存在"（KeyError）和"状态不允许推进"（TransitionError）
-    明确区分开，绝不硬按旧语义解释。
+    明确区分开，绝不硬按旧语义解释，也绝不静默跳过。
+
+    单条链路（查询/推进/接管）携带 execution_id / record_version；
+    批量链路（list_due_retries）一次返回所有不支持记录的 (id, version)，
+    消费方据此明确知道有哪些记录被拒绝，而不是只拿到一个"看似正常"的列表。
     """
 
-    def __init__(self, execution_id: str, record_version: int) -> None:
+    def __init__(
+        self,
+        unsupported: tuple[tuple[str, int], ...],
+        context: str = "读取",
+    ) -> None:
+        if not unsupported:
+            raise ValueError("RecordVersionError 至少要携带一条不支持的记录")
+        self.unsupported = unsupported
+        self.context = context
+        first_id, first_version = unsupported[0]
+        self.execution_id = first_id
+        self.record_version = first_version
+        detail = ", ".join(f"{eid}(v{ver})" for eid, ver in unsupported)
         super().__init__(
-            f"执行记录 {execution_id} 的版本 v{record_version} 高于当前支持的 "
-            f"v{RECORD_SCHEMA_VERSION}，拒绝按旧语义解释"
+            f"{context}时发现 {len(unsupported)} 条执行记录的版本高于当前支持的 "
+            f"v{RECORD_SCHEMA_VERSION}，明确拒绝且不静默跳过：{detail}"
         )
-        self.execution_id = execution_id
-        self.record_version = record_version
+
+    @classmethod
+    def for_batch(
+        cls, unsupported: list[tuple[str, int]], context: str = "批量列出到期重试"
+    ) -> "RecordVersionError":
+        """批量口径：携带全部不受支持记录（稳定排序，便于断言与审计）。"""
+        return cls(tuple(sorted(unsupported)), context)
 
 
 class ExecutionStatus(str, enum.Enum):
@@ -117,3 +138,18 @@ class ExecutionRecord:
     record_version: int = RECORD_SCHEMA_VERSION
     next_attempt_at: float = 0.0  # 最早可执行时刻（WAITING_RETRY 时生效）
     remaining_attempts: int = -1  # 剩余尝试次数；-1 表示未排期（v1 语义）
+
+
+@dataclass(frozen=True)
+class InterruptedRecord:
+    """重启恢复扫描到的悬挂记录（未经版本门控的原始视图）。
+
+    恢复链路必须自己对 record_version 给出明确处置（拒绝或落终态），
+    既不能把高版本行物化成 ExecutionRecord 按旧语义解释，也不能静默跳过。
+    """
+
+    execution_id: str
+    fingerprint: str
+    policy_id: str
+    attempt: int
+    record_version: int

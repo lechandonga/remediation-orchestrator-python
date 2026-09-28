@@ -8,7 +8,9 @@
 remaining_attempts；到期前任何推进请求都以可区分原因被拒绝，到期后由
 run_execution 或后台批量消费（list_due_retries + claim_due_retry）推进。
 重启恢复（recover_interrupted）：悬挂的 RUNNING 记录收尾为 ABANDONED 并写审计；
-WAITING_RETRY 记录的排期字段原样保留。
+其中版本高于当前支持的记录同样收尾为明确终态并留下 RECOVERY_UNSUPPORTED_VERSION
+依据（绝不静默悬置），attempt 不增加、不重复执行；WAITING_RETRY 记录的排期字段
+原样保留。
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ from dataclasses import dataclass
 from .authz import AuthzError, authorize
 from .dedup import Deduplicator
 from .models import (
+    RECORD_SCHEMA_VERSION,
     AlertEvent,
     ExecutionRecord,
     ExecutionStatus,
@@ -252,7 +255,13 @@ class OrchestratorService:
 
     # ---- 到期重试的批量消费 ----
     def list_due_retries(self, now: float) -> list[ExecutionRecord]:
-        """列出当前所有已到期的等待重试记录，供后台任务或操作者批量消费。"""
+        """列出当前所有已到期的等待重试记录，供后台任务或操作者批量消费。
+
+        批量口径与单条一致：到期集合中若存在版本高于当前支持的记录，
+        抛出携带全部违规记录的 RecordVersionError，绝不静默跳过；
+        三类结论始终可区分——版本不支持 RecordVersionError、
+        记录不存在 KeyError、状态不允许推进 TransitionError。
+        """
         return self._store.list_due_retries(now)
 
     def claim_due_retry(self, execution_id: str, now: float) -> ExecutionRecord:
@@ -289,30 +298,44 @@ class OrchestratorService:
         """把重启前已开始但未完结（RUNNING 悬挂）的记录收尾为 ABANDONED。
 
         - 收尾经由 CAS 完成并写 RECOVERY 审计（含依据），重复调用幂等；
-        - 不增加 attempt，不对已计数的尝试重复计数；
-        - WAITING_RETRY 记录的排期字段原样保留，不在此触碰。
+        - 不增加 attempt，不对已计数的尝试重复计数，不重复执行；
+        - WAITING_RETRY 记录的排期字段原样保留，不在此触碰；
+        - 版本高于当前支持的悬挂记录不会被静默跳过：同样经 CAS 收尾为明确终态
+          ABANDONED，并写 RECOVERY_UNSUPPORTED_VERSION 依据，说明其记录版本与
+          当前支持上限，后续查询/推进仍会按"版本不支持"被明确拒绝，与"记录不
+          存在""状态不允许推进"始终可区分。
         """
         recovered: list[str] = []
         for record in self._store.list_interrupted():
-            detail = (
-                "RECOVERY_INTERRUPTED: 服务重启前执行未给出结果，"
-                "按恢复口径收尾为终态 ABANDONED"
-            )
+            unsupported = record.record_version > RECORD_SCHEMA_VERSION
+            if unsupported:
+                detail = (
+                    "RECOVERY_UNSUPPORTED_VERSION: 服务重启前执行未给出结果，"
+                    f"记录版本 v{record.record_version} 高于当前支持的 "
+                    f"v{RECORD_SCHEMA_VERSION}，不按旧语义继续执行，"
+                    "按恢复口径收尾为明确终态 ABANDONED"
+                )
+            else:
+                detail = (
+                    "RECOVERY_INTERRUPTED: 服务重启前执行未给出结果，"
+                    "按恢复口径收尾为终态 ABANDONED"
+                )
             ok = self._store.compare_and_set_status(
                 record.execution_id,
                 (ExecutionStatus.RUNNING,),
                 ExecutionStatus.ABANDONED,
-                record.attempt,
+                record.attempt,  # 保持原 attempt，绝不重复计数
                 detail,
                 now,
             )
             if not ok:
-                continue  # 已被并发恢复者处理，不重复计数
+                continue  # 已被并发恢复者处理，不重复计数、不重复审计
             policy = self._policies.get(record.policy_id)
             cooldown = policy.cooldown_seconds if policy else 0.0
             self._store.release_fingerprint(record.fingerprint, now, cooldown)
             self._store.audit("RECOVERY", record.execution_id, detail, now)
             recovered.append(record.execution_id)
+        recovered.sort()
         return recovered
 
     # ---- 查询 ----

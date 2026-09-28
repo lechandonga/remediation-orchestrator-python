@@ -87,6 +87,12 @@ SUCCEEDED / ABANDONED / SUPPRESSED 为终态
 
 - `GET /retries/due`（或服务方法 `list_due_retries(now)`）一次列出当前所有
   已到期的等待重试记录，供后台任务或操作者批量消费；
+- **批量口径与单条一致，绝不静默跳过**：到期集合中若存在版本高于当前支持的
+  记录，整个请求被明确拒绝（`RecordVersionError` / HTTP 422
+  `UNSUPPORTED_RECORD_VERSION`），错误信息点名全部违规记录（如
+  `exec-v3(v3)`）。不会把这些记录悄悄过滤掉再返回一个"看似正常"的空列表；
+  未到期的高版本记录不参与该口径（它们本来就还不该被消费）。受支持的
+  v1/v2 到期记录行为完全不受影响；
 - 消费方通过 `POST /retries/{id}/claim`（或 `claim_due_retry`）原子接管：
   单条 SQL 内完成状态、到期条件校验与尝试计数自增，多路并发消费同一记录时
   **只有一个消费方成功**，其余拿到 `ILLEGAL_TRANSITION` 的明确失败结论；
@@ -101,6 +107,11 @@ SUCCEEDED / ABANDONED / SUPPRESSED 为终态
   `ABANDONED`，审计日志写入 `RECOVERY` 事件及依据
   （`RECOVERY_INTERRUPTED: 服务重启前执行未给出结果...`）；恢复幂等，
   不增加 `attempt`，不对已计数的尝试重复计数；
+- **版本高于当前支持的悬挂记录同样不会被无声跳过**：它们不能按旧语义继续
+  执行，恢复时经同一个 CAS 收尾为明确终态 `ABANDONED`，并写入可区分的审计
+  依据 `RECOVERY_UNSUPPORTED_VERSION`（记录其版本与当前支持上限）。因此这类
+  记录既不会永远悬着，也不会被重复执行或重复计数（`attempt` 保持原值）；
+  恢复后单条查询/推进/接管仍会按"版本不支持"被明确拒绝，三类结论始终分得开；
 - 重启前还没到时间的 `WAITING_RETRY` 记录，其 `next_attempt_at` 与
   `remaining_attempts` **原样保留**，不会被提前安排、推迟或清零，
   到期后仍可正常被消费。
@@ -108,16 +119,25 @@ SUCCEEDED / ABANDONED / SUPPRESSED 为终态
 ## 记录版本兼容
 
 - 执行记录结构版本由 `RECORD_SCHEMA_VERSION = 2` 标识（与策略版本
-  `SCHEMA_VERSION` 相互独立）；
+  `SCHEMA_VERSION` 相互独立）；兼容边界明确：**低版本记录迁移后按原语义继续
+  参与执行，当前版本记录的排期/到期消费/并发接管行为不受影响，只有确实高于
+  当前支持版本（`record_version > 2`）的记录才走"明确拒绝"**；
 - **v1（历史记录）**：无排期字段。启动时存储层幂等迁移（`ALTER TABLE` 补列，
   默认值 `record_version=1 / next_attempt_at=0 / remaining_attempts=-1`），
   已有行不被改写；v1 记录按原语义继续参与执行——失败后立即回到 `PENDING`，
   无排期门控，不会被当作数据缺失或直接失败；
-- **v2（当前版本）**：失败后进入 `WAITING_RETRY` 定时排期；
-- **高于当前版本的记录**：读取与推进时抛出 `RecordVersionError`
-  （HTTP 422，`UNSUPPORTED_RECORD_VERSION`），与"记录不存在"（KeyError /
-  HTTP 404）和"状态不允许推进"（`TransitionError` / HTTP 409）明确区分，
-  绝不硬按旧语义解释；也不会混入到期重试列表被批量消费。
+- **v2（当前版本）**：失败后进入 `WAITING_RETRY` 定时排期；到期列出、
+  到期消费、并发接管均为受支持行为，不因兼容检查改变任何语义；
+- **高于当前版本的记录**：单条链路（查询、推进、接管、上报结果）抛出
+  `RecordVersionError`（HTTP 422，`UNSUPPORTED_RECORD_VERSION`）；
+  批量列到期记录时同样抛出，异常的 `unsupported` 属性携带全部违规记录
+  `(execution_id, record_version)` 列表并在错误信息中点名，绝不静默跳过；
+  重启恢复时悬挂的高版本 `RUNNING` 记录被收尾为明确终态 `ABANDONED` 并留下
+  `RECOVERY_UNSUPPORTED_VERSION` 审计依据，不悬置、不重复计数、不重复执行；
+- 三类结论在任何链路上都始终可区分：**"版本不支持"** `RecordVersionError`
+  （HTTP 422）、**"记录不存在"** `KeyError`（HTTP 404）、**"状态不允许推进"**
+  `TransitionError`（HTTP 409，原因取 `TERMINAL_STATE` / `ILLEGAL_TRANSITION` /
+  `RETRY_NOT_DUE` / `RETRY_EXHAUSTED`）。
 
 ## 权限校验
 
@@ -150,7 +170,7 @@ SUCCEEDED / ABANDONED / SUPPRESSED 为终态
 
 ```bash
 uv sync
-uv run pytest tests/ -v        # 23 个测试：去重/并发/非法流转/定时重试/恢复/版本兼容等
+uv run pytest tests/ -v        # 28 个测试：去重/并发/非法流转/定时重试/恢复/版本兼容等
 uv run uvicorn main:app        # 启动服务（启动时自动执行重启恢复）
 ```
 
@@ -168,6 +188,20 @@ uv run uvicorn main:app        # 启动服务（启动时自动执行重启恢�
 - **重启恢复**：让一条记录停在 `RUNNING`（如 claim 后不 finish），重启进程，
   启动日志/审计中可见 `RECOVERY` 事件，该记录被收尾为 `ABANDONED`；
   未到期的 `WAITING_RETRY` 记录排期字段重启前后保持一致；
+- **批量列遇到高版本不静默跳过**：直接往 `executions` 表写入一条
+  `status='WAITING_RETRY'` 且 `next_attempt_at` 已到期的 `record_version=3`
+  记录（可参考测试辅助函数 `insert_raw_execution`），再 `GET /retries/due`，
+  收到 422 `UNSUPPORTED_RECORD_VERSION` 且响应中点名 `exec-xxx(v3)`；
+  把它与一条正常的到期记录混写时，请求同样被明确拒绝；把其排期推到未来后，
+  正常记录照常返回与消费；
+- **重启恢复遇到高版本**：写入一条 `status='RUNNING'` 的 `record_version=3`
+  悬挂记录后重新打开同一数据库并调用 `recover_interrupted`（或重启进程），
+  该记录被收尾为 `ABANDONED`、`attempt` 不变，审计中出现
+  `RECOVERY_UNSUPPORTED_VERSION` 依据；再调用一次恢复不产生重复审计；此后
+  单条查询/推进仍得到 422 `UNSUPPORTED_RECORD_VERSION`，与 404/409 分得开；
 - **版本兼容**：测试 `test_old_schema_db_migrated_and_readable` 构造 v1 时代的
-  历史库验证幂等迁移与旧语义执行；`test_unsupported_future_version_rejected_distinctly`
-  验证未来版本记录被明确拒绝（422）且与 404/409 分得开。
+  历史库验证幂等迁移与旧语义执行；
+  `test_unsupported_future_version_rejected_distinctly` 验证未来版本记录在单条
+  与批量口径上都被明确拒绝（422）且与 404/409 分得开；
+  `test_list_due_retries_*` 覆盖批量链路的单条/混合/三类结论区分，
+  `test_recovery_*` 覆盖重启恢复链路的单条/混合/幂等/计数不漂移。

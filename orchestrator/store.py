@@ -12,6 +12,7 @@ from .models import (
     RECORD_SCHEMA_VERSION,
     ExecutionRecord,
     ExecutionStatus,
+    InterruptedRecord,
     RecordVersionError,
 )
 
@@ -117,7 +118,10 @@ class Store:
     def _row_to_record(row: sqlite3.Row) -> ExecutionRecord:
         record_version = row["record_version"]
         if record_version > RECORD_SCHEMA_VERSION:
-            raise RecordVersionError(row["execution_id"], record_version)
+            raise RecordVersionError(
+                ((row["execution_id"], record_version),),
+                context="读取执行记录",
+            )
         return ExecutionRecord(
             execution_id=row["execution_id"],
             fingerprint=row["fingerprint"],
@@ -203,15 +207,24 @@ class Store:
     def list_due_retries(self, now: float) -> list[ExecutionRecord]:
         """列出所有已到期的等待重试记录（按最早可执行时刻排序，供批量消费）。
 
-        版本高于当前支持的记录不列出（读取时会明确拒绝，绝不按旧语义解释）。
+        批量口径与单条读取一致：只要到期集合中存在版本高于当前支持的记录，
+        就抛出 RecordVersionError（携带全部违规记录），绝不静默过滤成一个
+        "看似正常"的列表；受支持的 v1/v2 到期记录照常返回。
         """
         with self._lock:
             cur = self._conn.execute(
                 "SELECT * FROM executions WHERE status = ? AND next_attempt_at <= ?"
-                " AND record_version <= ? ORDER BY next_attempt_at, execution_id",
-                (ExecutionStatus.WAITING_RETRY.value, now, RECORD_SCHEMA_VERSION),
+                " ORDER BY next_attempt_at, execution_id",
+                (ExecutionStatus.WAITING_RETRY.value, now),
             )
             rows = cur.fetchall()
+        unsupported = [
+            (r["execution_id"], r["record_version"])
+            for r in rows
+            if r["record_version"] > RECORD_SCHEMA_VERSION
+        ]
+        if unsupported:
+            raise RecordVersionError.for_batch(unsupported)
         return [self._row_to_record(r) for r in rows]
 
     def claim_due_retry(self, execution_id: str, now: float) -> bool:
@@ -236,15 +249,29 @@ class Store:
             return cur.rowcount == 1
 
     # ---- 重启恢复 ----
-    def list_interrupted(self) -> list[ExecutionRecord]:
-        """列出重启前已开始但未给出结果的记录（RUNNING 悬挂）。"""
+    def list_interrupted(self) -> list[InterruptedRecord]:
+        """列出重启前已开始但未给出结果的记录（RUNNING 悬挂），不做版本过滤。
+
+        高版本行同样返回（原始视图），由恢复服务明确处置，
+        既不静默跳过让它永远悬着，也不在此按旧语义物化成 ExecutionRecord。
+        """
         with self._lock:
             cur = self._conn.execute(
-                "SELECT * FROM executions WHERE status = ? AND record_version <= ?",
-                (ExecutionStatus.RUNNING.value, RECORD_SCHEMA_VERSION),
+                "SELECT * FROM executions WHERE status = ?"
+                " ORDER BY execution_id",
+                (ExecutionStatus.RUNNING.value,),
             )
             rows = cur.fetchall()
-        return [self._row_to_record(r) for r in rows]
+        return [
+            InterruptedRecord(
+                execution_id=r["execution_id"],
+                fingerprint=r["fingerprint"],
+                policy_id=r["policy_id"],
+                attempt=r["attempt"],
+                record_version=r["record_version"],
+            )
+            for r in rows
+        ]
 
     # ---- 审计 ----
     def audit(self, event_type: str, subject: str, detail: str, now: float) -> None:
