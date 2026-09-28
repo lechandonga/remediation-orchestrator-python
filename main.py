@@ -92,8 +92,15 @@ def run_execution(execution_id: str, body: RunIn):
 
 @app.get("/retries/due")
 def list_due_retries():
-    """列出当前所有已到期的等待重试记录，供后台任务批量消费。"""
-    records = service.list_due_retries(now=time.time())
+    """列出当前所有已到期的等待重试记录，供后台任务批量消费。
+
+    若存在版本高于当前支持的到期记录，明确返回 422
+    （UNSUPPORTED_RECORD_VERSION），绝不静默跳过、返回残缺列表。
+    """
+    try:
+        records = service.list_due_retries(now=time.time())
+    except RecordVersionError as e:
+        raise HTTPException(status_code=422, detail=f"UNSUPPORTED_RECORD_VERSION: {e}")
     return [
         {"execution_id": r.execution_id, "next_attempt_at": r.next_attempt_at,
          "remaining_attempts": r.remaining_attempts, "attempt": r.attempt}

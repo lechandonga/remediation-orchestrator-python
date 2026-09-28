@@ -8,7 +8,10 @@
 remaining_attempts；到期前任何推进请求都以可区分原因被拒绝，到期后由
 run_execution 或后台批量消费（list_due_retries + claim_due_retry）推进。
 重启恢复（recover_interrupted）：悬挂的 RUNNING 记录收尾为 ABANDONED 并写审计；
-WAITING_RETRY 记录的排期字段原样保留。
+版本高于当前支持的悬挂记录同样明确收尾为终态并留下可区分依据
+（RECOVERY_UNSUPPORTED_VERSION），绝不无声悬挂；WAITING_RETRY 记录的
+排期字段原样保留。批量列出到期重试（list_due_retries）与单条口径一致：
+碰到不支持的更高版本明确抛出 RecordVersionError，不静默跳过。
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ from dataclasses import dataclass
 from .authz import AuthzError, authorize
 from .dedup import Deduplicator
 from .models import (
+    RECORD_SCHEMA_VERSION,
     AlertEvent,
     ExecutionRecord,
     ExecutionStatus,
@@ -290,7 +294,10 @@ class OrchestratorService:
 
         - 收尾经由 CAS 完成并写 RECOVERY 审计（含依据），重复调用幂等；
         - 不增加 attempt，不对已计数的尝试重复计数；
-        - WAITING_RETRY 记录的排期字段原样保留，不在此触碰。
+        - WAITING_RETRY 记录的排期字段原样保留，不在此触碰；
+        - 版本高于当前支持的悬挂记录不做语义解释，但同样明确收尾为终态
+          ABANDONED 并写 RECOVERY 审计（依据 RECOVERY_UNSUPPORTED_VERSION），
+          绝不无声无息地挂着，也不会被重复执行或重复计数。
         """
         recovered: list[str] = []
         for record in self._store.list_interrupted():
@@ -313,6 +320,30 @@ class OrchestratorService:
             self._store.release_fingerprint(record.fingerprint, now, cooldown)
             self._store.audit("RECOVERY", record.execution_id, detail, now)
             recovered.append(record.execution_id)
+
+        for execution_id, record_version, attempt, fingerprint, policy_id in (
+            self._store.list_interrupted_unsupported()
+        ):
+            detail = (
+                f"RECOVERY_UNSUPPORTED_VERSION: 记录版本 v{record_version} 高于当前支持的 "
+                f"v{RECORD_SCHEMA_VERSION}，恢复过程不做语义解释，"
+                "明确收尾为终态 ABANDONED，不重试、不重复执行"
+            )
+            ok = self._store.compare_and_set_status(
+                execution_id,
+                (ExecutionStatus.RUNNING,),
+                ExecutionStatus.ABANDONED,
+                attempt,  # 保持原计数，不重复计数
+                detail,
+                now,
+            )
+            if not ok:
+                continue  # 已被并发恢复者处理
+            policy = self._policies.get(policy_id)
+            cooldown = policy.cooldown_seconds if policy else 0.0
+            self._store.release_fingerprint(fingerprint, now, cooldown)
+            self._store.audit("RECOVERY", execution_id, detail, now)
+            recovered.append(execution_id)
         return recovered
 
     # ---- 查询 ----

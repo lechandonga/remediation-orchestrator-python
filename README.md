@@ -87,6 +87,9 @@ SUCCEEDED / ABANDONED / SUPPRESSED 为终态
 
 - `GET /retries/due`（或服务方法 `list_due_retries(now)`）一次列出当前所有
   已到期的等待重试记录，供后台任务或操作者批量消费；
+- **批量口径与单条口径一致**：若已到期的记录中存在版本高于当前支持的记录，
+  接口明确返回 422（`UNSUPPORTED_RECORD_VERSION`），绝不静默跳过、
+  返回一个"看起来正常"的残缺列表；尚未到期的高版本记录不影响本次列出；
 - 消费方通过 `POST /retries/{id}/claim`（或 `claim_due_retry`）原子接管：
   单条 SQL 内完成状态、到期条件校验与尝试计数自增，多路并发消费同一记录时
   **只有一个消费方成功**，其余拿到 `ILLEGAL_TRANSITION` 的明确失败结论；
@@ -101,9 +104,16 @@ SUCCEEDED / ABANDONED / SUPPRESSED 为终态
   `ABANDONED`，审计日志写入 `RECOVERY` 事件及依据
   （`RECOVERY_INTERRUPTED: 服务重启前执行未给出结果...`）；恢复幂等，
   不增加 `attempt`，不对已计数的尝试重复计数；
+- 重启前已开始但未完结、且**版本高于当前支持**的 `RUNNING` 悬挂记录：
+  恢复过程不做语义解释，但也不会让它无声无息地挂着——同样经 CAS 明确
+  收尾为终态 `ABANDONED`，审计日志写入 `RECOVERY` 事件及可区分依据
+  （`RECOVERY_UNSUPPORTED_VERSION: 记录版本 vN 高于当前支持的 v2...`）；
+  不增加 `attempt`、不重复计数、不会被重复执行（此后单条读取/推进仍按
+  `UNSUPPORTED_RECORD_VERSION` 明确拒绝）；
 - 重启前还没到时间的 `WAITING_RETRY` 记录，其 `next_attempt_at` 与
   `remaining_attempts` **原样保留**，不会被提前安排、推迟或清零，
-  到期后仍可正常被消费。
+  到期后仍可正常被消费（高版本等待记录亦原样保留，到期后由批量列出
+  明确拒绝，见上节）。
 
 ## 记录版本兼容
 
@@ -117,7 +127,9 @@ SUCCEEDED / ABANDONED / SUPPRESSED 为终态
 - **高于当前版本的记录**：读取与推进时抛出 `RecordVersionError`
   （HTTP 422，`UNSUPPORTED_RECORD_VERSION`），与"记录不存在"（KeyError /
   HTTP 404）和"状态不允许推进"（`TransitionError` / HTTP 409）明确区分，
-  绝不硬按旧语义解释；也不会混入到期重试列表被批量消费。
+  绝不硬按旧语义解释；批量列出到期重试时同样明确拒绝（422），不会静默
+  跳过、返回残缺列表；重启恢复时悬挂的高版本 `RUNNING` 记录被明确收尾
+  为终态 `ABANDONED` 并留下 `RECOVERY_UNSUPPORTED_VERSION` 审计依据。
 
 ## 权限校验
 
@@ -150,7 +162,7 @@ SUCCEEDED / ABANDONED / SUPPRESSED 为终态
 
 ```bash
 uv sync
-uv run pytest tests/ -v        # 23 个测试：去重/并发/非法流转/定时重试/恢复/版本兼容等
+uv run pytest tests/ -v        # 28 个测试：去重/并发/非法流转/定时重试/恢复/版本兼容等
 uv run uvicorn main:app        # 启动服务（启动时自动执行重启恢复）
 ```
 
@@ -170,4 +182,34 @@ uv run uvicorn main:app        # 启动服务（启动时自动执行重启恢�
   未到期的 `WAITING_RETRY` 记录排期字段重启前后保持一致；
 - **版本兼容**：测试 `test_old_schema_db_migrated_and_readable` 构造 v1 时代的
   历史库验证幂等迁移与旧语义执行；`test_unsupported_future_version_rejected_distinctly`
-  验证未来版本记录被明确拒绝（422）且与 404/409 分得开。
+  验证未来版本记录被明确拒绝（422）且与 404/409 分得开；
+  `test_list_due_retries_rejects_single_unsupported_record` /
+  `test_list_due_retries_rejects_mixed_with_normal_records` 验证批量列出
+  到期记录时高版本记录（单条、与正常记录混合、未到期/到期）均给出明确
+  拒绝而非静默跳过；`test_recovery_finalizes_unsupported_running_record` /
+  `test_recovery_mixed_supported_and_unsupported` /
+  `test_recovery_preserves_unsupported_waiting_record_for_due_list` 验证
+  重启恢复把高版本悬挂记录明确收尾为终态并留下可区分审计依据（幂等、
+  不重复计数、不重复执行）。
+
+手动复现高版本记录的两条链路（直接用 sqlite3 往库里写一条 v3 记录）：
+
+```bash
+# 1) 批量列出：写入一条已到期的 v3 等待重试记录后，
+#    GET /retries/due 返回 422 UNSUPPORTED_RECORD_VERSION，而不是残缺列表
+sqlite3 orchestrator.db "INSERT INTO executions
+  (execution_id, fingerprint, policy_id, policy_version, status, attempt,
+   record_version, next_attempt_at, remaining_attempts)
+  VALUES ('exec-v3', 'fp-x', 'restart-web', 1, 'WAITING_RETRY', 1, 3, 0, 1);"
+curl -i http://127.0.0.1:8000/retries/due        # -> 422
+
+# 2) 重启恢复：写入一条 v3 的 RUNNING 悬挂记录后重启进程，
+#    审计日志出现 RECOVERY_UNSUPPORTED_VERSION，记录被收尾为 ABANDONED
+sqlite3 orchestrator.db "UPDATE executions SET status='RUNNING',
+  next_attempt_at=0, remaining_attempts=-1 WHERE execution_id='exec-v3';"
+# 重启服务后：
+sqlite3 orchestrator.db "SELECT status, attempt FROM executions
+  WHERE execution_id='exec-v3';"                  # -> ABANDONED|1（计数不变）
+sqlite3 orchestrator.db "SELECT detail FROM audit_log
+  WHERE event_type='RECOVERY';"                   # -> RECOVERY_UNSUPPORTED_VERSION...
+```

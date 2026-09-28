@@ -325,5 +325,145 @@ def test_unsupported_future_version_rejected_distinctly():
         insert_raw_execution(svc._store, "exec-terminal", "SUCCEEDED")
         svc.run_execution("exec-terminal", succeed=True, now=0.0)
 
-    # 不受支持版本不会混入到期列表被批量消费
-    assert svc.list_due_retries(now=100.0) == []
+    # 不受支持版本不会混入到期列表被批量消费：批量口径与单条口径一致，
+    # 明确拒绝（RecordVersionError）而不是静默跳过、返回残缺列表
+    with pytest.raises(RecordVersionError):
+        svc.list_due_retries(now=100.0)
+
+
+# ---------- 版本兼容：批量列出到期记录的口径 ----------
+
+def read_raw_status(store: Store, execution_id: str) -> tuple[str, int]:
+    """绕过版本校验直接读库（高版本记录无法经 get_execution 读取）。"""
+    with store._lock:
+        row = store._conn.execute(
+            "SELECT status, attempt FROM executions WHERE execution_id = ?",
+            (execution_id,),
+        ).fetchone()
+    return row["status"], row["attempt"]
+
+
+def test_list_due_retries_rejects_single_unsupported_record():
+    svc = make_service()
+    insert_raw_execution(svc._store, "exec-v3", "WAITING_RETRY",
+                         record_version=3, next_attempt_at=5.0, remaining_attempts=1)
+
+    # 未到期时不影响列表（本就不该出现在"已到期"口径里）
+    assert svc.list_due_retries(now=4.0) == []
+
+    # 到期后明确拒绝，且与"记录不存在""状态不允许推进"分得开
+    with pytest.raises(RecordVersionError) as ei:
+        svc.list_due_retries(now=5.0)
+    log.info("批量拒绝(单条高版本): %s", ei.value)
+    assert ei.value.execution_id == "exec-v3" and ei.value.record_version == 3
+    assert not isinstance(ei.value, (KeyError, TransitionError))
+
+
+def test_list_due_retries_rejects_mixed_with_normal_records():
+    svc = make_service()
+    eid_ok = ingest(svc)
+    svc.run_execution(eid_ok, succeed=False, now=10.0)  # 正常记录，due at 11.0
+    insert_raw_execution(svc._store, "exec-v9", "WAITING_RETRY",
+                         record_version=9, next_attempt_at=20.0, remaining_attempts=2)
+
+    # 高版本记录未到期时，正常记录的列出不受影响
+    due = svc.list_due_retries(now=11.0)
+    log.info("到期记录(高版本未到期): %s", [r.execution_id for r in due])
+    assert [r.execution_id for r in due] == [eid_ok]
+
+    # 高版本记录也到期后：明确拒绝，而不是返回"看起来正常"的残缺列表
+    with pytest.raises(RecordVersionError) as ei:
+        svc.list_due_retries(now=20.0)
+    log.info("批量拒绝(混合): %s", ei.value)
+    assert ei.value.execution_id == "exec-v9" and ei.value.record_version == 9
+
+    # 正常记录本身并未被消费或改动，拒绝无副作用
+    rec = svc.get_execution(eid_ok)
+    assert rec.status is S.WAITING_RETRY and rec.attempt == 1
+
+
+# ---------- 版本兼容：重启恢复的口径 ----------
+
+def test_recovery_finalizes_unsupported_running_record(tmp_path):
+    db = str(tmp_path / "state.db")
+    svc1 = make_service(store=Store(db))
+    # 重启前已开始、未出结果、版本高于当前支持的悬挂记录
+    insert_raw_execution(svc1._store, "exec-v3", "RUNNING",
+                         record_version=3, attempt=2)
+    svc1._store.close()
+
+    svc2 = make_service(store=Store(db))
+    recovered = svc2.recover_interrupted(now=50.0)
+    log.info("恢复(高版本悬挂): recovered=%s", recovered)
+    assert recovered == ["exec-v3"]
+
+    # 落到明确的合法终态，且已计数的尝试不重复计数
+    status, attempt = read_raw_status(svc2._store, "exec-v3")
+    assert status == "ABANDONED" and attempt == 2
+
+    # 留下可区分的审计依据
+    audits = [a for a in svc2._store.audit_log() if a[1] == "RECOVERY"]
+    log.info("恢复依据: %s", [a[3] for a in audits])
+    assert len(audits) == 1
+    assert "RECOVERY_UNSUPPORTED_VERSION" in audits[0][3] and "v3" in audits[0][3]
+
+    # 恢复幂等：再次执行不产生新的收尾或审计
+    assert svc2.recover_interrupted(now=51.0) == []
+    assert len([a for a in svc2._store.audit_log() if a[1] == "RECOVERY"]) == 1
+
+    # 不会被重复执行：单条口径仍明确拒绝（版本不受支持，而非不存在）
+    with pytest.raises(RecordVersionError):
+        svc2.run_execution("exec-v3", succeed=True, now=52.0)
+    with pytest.raises(RecordVersionError):
+        svc2.claim_due_retry("exec-v3", now=52.0)
+
+
+def test_recovery_mixed_supported_and_unsupported(tmp_path):
+    db = str(tmp_path / "state.db")
+    svc1 = make_service(store=Store(db))
+    eid_ok = ingest(svc1, "a1", "fp-1")
+    svc1._store.compare_and_set_status(
+        eid_ok, (S.PENDING,), S.RUNNING, 1, "开始执行", 5.0
+    )
+    insert_raw_execution(svc1._store, "exec-v3", "RUNNING",
+                         record_version=3, attempt=4)
+    svc1._store.close()
+
+    svc2 = make_service(store=Store(db))
+    recovered = svc2.recover_interrupted(now=50.0)
+    log.info("恢复(混合): recovered=%s", recovered)
+    assert sorted(recovered) == sorted([eid_ok, "exec-v3"])
+
+    # 两条都落到终态，计数均未漂移
+    rec_ok = svc2.get_execution(eid_ok)
+    assert rec_ok.status is S.ABANDONED and rec_ok.attempt == 1
+    status, attempt = read_raw_status(svc2._store, "exec-v3")
+    assert status == "ABANDONED" and attempt == 4
+
+    # 两类依据可区分：正常悬挂 vs 版本不受支持
+    audits = [a[3] for a in svc2._store.audit_log() if a[1] == "RECOVERY"]
+    log.info("恢复依据: %s", audits)
+    assert len(audits) == 2
+    assert sum("RECOVERY_INTERRUPTED" in d for d in audits) == 1
+    assert sum("RECOVERY_UNSUPPORTED_VERSION" in d for d in audits) == 1
+
+    # 幂等
+    assert svc2.recover_interrupted(now=51.0) == []
+
+
+def test_recovery_preserves_unsupported_waiting_record_for_due_list(tmp_path):
+    db = str(tmp_path / "state.db")
+    svc1 = make_service(store=Store(db))
+    # 高版本但处于等待重试（非 RUNNING 悬挂）：恢复不触碰，排期字段原样保留
+    insert_raw_execution(svc1._store, "exec-v3-wait", "WAITING_RETRY",
+                         record_version=3, next_attempt_at=7.0, remaining_attempts=1)
+    svc1._store.close()
+
+    svc2 = make_service(store=Store(db))
+    assert svc2.recover_interrupted(now=50.0) == []
+    assert read_raw_status(svc2._store, "exec-v3-wait") == ("WAITING_RETRY", 0)
+    assert svc2._store.audit_log() == []  # 无任何静默处置
+
+    # 到期后由批量列出明确拒绝，而不是被静默跳过
+    with pytest.raises(RecordVersionError):
+        svc2.list_due_retries(now=7.0)
